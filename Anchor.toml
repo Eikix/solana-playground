@@ -1,0 +1,20 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+example = "5UeDXpRmJ9VW8vhnBVtTBTFmBS387T5fHSMQcVVDL2Q"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "bun test"
+
+[toolchain]
+anchor_version = "0.31.1"
+solana_version = "2.1.0"
