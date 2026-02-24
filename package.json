@@ -1,0 +1,23 @@
+{
+	"name": "solana-playground",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "anchor build",
+		"test": "bun test",
+		"test:rust": "cargo test --all",
+		"lint": "biome check .",
+		"format": "biome format --write .",
+		"format:check": "biome format .",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@coral-xyz/anchor": "^0.31.1",
+		"@solana/kit": "^6.1.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.4",
+		"@types/bun": "latest",
+		"typescript": "^5.7.0"
+	}
+}
