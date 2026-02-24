@@ -1,6 +1,6 @@
-use mollusk_svm::Mollusk;
 use mollusk_svm::program::keyed_account_for_system_program;
 use mollusk_svm::result::Check;
+use mollusk_svm::Mollusk;
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
@@ -9,8 +9,8 @@ use solana_rent::Rent;
 /// The program ID must match the `declare_id!` in the program source.
 /// `5UeDXpRmJ9VW8vhnBVtTBTFmBS387T5fHSMQcVVDL2Q` decoded from base58.
 const PROGRAM_ID_BYTES: [u8; 32] = [
-    1, 37, 147, 231, 218, 185, 51, 192, 50, 245, 30, 84, 5, 117, 129, 208,
-    75, 21, 69, 77, 52, 58, 0, 246, 131, 248, 123, 230, 204, 140, 57, 93,
+    1, 37, 147, 231, 218, 185, 51, 192, 50, 245, 30, 84, 5, 117, 129, 208, 75, 21, 69, 77, 52, 58,
+    0, 246, 131, 248, 123, 230, 204, 140, 57, 93,
 ];
 
 /// Anchor discriminator for `initialize`: sha256("global:initialize")[..8]
@@ -37,10 +37,8 @@ fn test_initialize() {
     let mollusk = Mollusk::new(&program_id, "example");
 
     let authority = Pubkey::new_unique();
-    let (data_pda, _bump) = Pubkey::find_program_address(
-        &[b"data", authority.as_ref()],
-        &program_id,
-    );
+    let (data_pda, _bump) =
+        Pubkey::find_program_address(&[b"data", authority.as_ref()], &program_id);
 
     let rent = Rent::default();
     // 8 (discriminator) + 32 (authority) + 8 (value) + 8 (last_slot) + 8 (last_timestamp) = 64

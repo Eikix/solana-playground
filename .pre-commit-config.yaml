@@ -1,0 +1,40 @@
+minimum_pre_commit_version: "3.7.0"
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: check-added-large-files
+        args: ["--maxkb=4096"]
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.43.0
+    hooks:
+      - id: typos
+        args: ["--config", ".typos.toml"]
+
+  - repo: local
+    hooks:
+      - id: solana-precommit
+        name: solana pre-commit (fast checks)
+        entry: bash scripts/pre-commit-checks.sh
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+
+      - id: solana-prepush
+        name: solana pre-push (tests)
+        entry: bash scripts/pre-push-checks.sh
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
