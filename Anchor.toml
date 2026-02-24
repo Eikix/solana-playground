@@ -4,6 +4,7 @@ skip-lint = false
 
 [programs.localnet]
 example = "5UeDXpRmJ9VW8vhnBVtTBTFmBS387T5fHSMQcVVDL2Q"
+recent_blockhash = "GEeGqsyMrqRBdBQwW4RsUeysWgp2RdRZnzBjMX11ozwi"
 
 [registry]
 url = "https://api.apr.dev"

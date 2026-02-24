@@ -1,0 +1,26 @@
+[package]
+name = "recent-blockhash"
+version = "0.1.0"
+description = "Read and log a recent blockhash from the SlotHashes sysvar"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "recent_blockhash"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+
+[dev-dependencies]
+mollusk-svm = "0.10.3"
+solana-account = "3.2"
+solana-instruction = "3.0"
+solana-pubkey = "4.0"
