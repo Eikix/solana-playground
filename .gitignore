@@ -1,0 +1,16 @@
+# Solana / Anchor
+target/
+.anchor/
+test-ledger/
+
+# Keys (local wallets)
+keys/*.json
+
+# Node
+node_modules/
+bun.lockb
+
+# OS
+.DS_Store
+
+# IDL build artifacts are tracked, but deploy keypairs are not
