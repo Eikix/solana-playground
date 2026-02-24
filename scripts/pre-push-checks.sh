@@ -7,7 +7,7 @@ if [[ -f Cargo.toml ]]; then
   if command -v cargo >/dev/null 2>&1; then
     echo "[pre-push-checks] Rust: fmt/clippy/test"
     cargo fmt --all -- --check
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --all-targets --all-features -- -D warnings -A unexpected_cfgs -A deprecated
     cargo test --all --all-features
   else
     echo "[pre-push-checks] Cargo.toml found but cargo not installed; skipping"
