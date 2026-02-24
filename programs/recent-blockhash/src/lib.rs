@@ -2,30 +2,81 @@ use anchor_lang::prelude::*;
 
 declare_id!("GEeGqsyMrqRBdBQwW4RsUeysWgp2RdRZnzBjMX11ozwi");
 
+// ── SlotHashes zero-copy reader ─────────────────────────────────────
+
+const HEADER_SIZE: usize = 8; // u64 count
+const ENTRY_SIZE: usize = 40; // u64 slot + [u8; 32] hash
+
+#[derive(Clone, Copy, Debug)]
+pub struct SlotHashEntry {
+    pub slot: u64,
+    pub hash: [u8; 32],
+}
+
+/// Zero-copy reader over borrowed SlotHashes sysvar data.
+/// Does not deserialize the whole sysvar — only parses the entries you access.
+pub struct SlotHashesReader<'a> {
+    data: &'a [u8],
+    count: u64,
+}
+
+impl<'a> SlotHashesReader<'a> {
+    pub fn new(data: &'a [u8]) -> std::result::Result<Self, RecentBlockhashError> {
+        if data.len() < HEADER_SIZE {
+            return Err(RecentBlockhashError::NoSlotHashes);
+        }
+        let count = u64::from_le_bytes(
+            data[..HEADER_SIZE]
+                .try_into()
+                .map_err(|_| RecentBlockhashError::InvalidData)?,
+        );
+        let expected = HEADER_SIZE + (count as usize) * ENTRY_SIZE;
+        if data.len() < expected {
+            return Err(RecentBlockhashError::InvalidData);
+        }
+        Ok(Self { data, count })
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub fn get(&self, index: u64) -> std::result::Result<SlotHashEntry, RecentBlockhashError> {
+        if index >= self.count {
+            return Err(RecentBlockhashError::IndexOutOfBounds);
+        }
+        let offset = HEADER_SIZE + (index as usize) * ENTRY_SIZE;
+        let slot = u64::from_le_bytes(
+            self.data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| RecentBlockhashError::InvalidData)?,
+        );
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&self.data[offset + 8..offset + 40]);
+        Ok(SlotHashEntry { slot, hash })
+    }
+
+    pub fn most_recent(&self) -> std::result::Result<SlotHashEntry, RecentBlockhashError> {
+        self.get(0)
+    }
+}
+
+// ── Program ─────────────────────────────────────────────────────────
+
 #[program]
 pub mod recent_blockhash {
     use super::*;
 
-    /// Read the most recent entry from the SlotHashes sysvar and log it.
-    ///
-    /// SlotHashes is serialized as:
-    ///   [count: u64] [entries: (slot: u64, hash: [u8; 32])...]
-    /// Each entry is 40 bytes. The first entry is the most recent.
     pub fn log_recent_hash(ctx: Context<LogRecentHash>) -> Result<()> {
         let data = ctx.accounts.slot_hashes.try_borrow_data()?;
+        let reader = SlotHashesReader::new(&data).map_err(|e| error!(e))?;
 
-        // Need at least 8 (count) + 40 (one entry) = 48 bytes
-        require!(data.len() >= 48, RecentBlockhashError::NoSlotHashes);
+        msg!("SlotHashes entries: {}", reader.count());
 
-        let count = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        msg!("SlotHashes entries: {}", count);
+        let entry = reader.most_recent().map_err(|e| error!(e))?;
 
-        // Parse the most recent entry
-        let slot = u64::from_le_bytes(data[8..16].try_into().unwrap());
-        let hash = &data[16..48];
-
-        msg!("Most recent slot: {}", slot);
-        msg!("Blockhash: {:?}", hash);
+        msg!("Most recent slot: {}", entry.slot);
+        msg!("Blockhash: {:?}", entry.hash);
 
         Ok(())
     }
@@ -42,4 +93,8 @@ pub struct LogRecentHash<'info> {
 pub enum RecentBlockhashError {
     #[msg("SlotHashes sysvar has no entries")]
     NoSlotHashes,
+    #[msg("SlotHashes data is malformed")]
+    InvalidData,
+    #[msg("Entry index out of bounds")]
+    IndexOutOfBounds,
 }

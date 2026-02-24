@@ -30,14 +30,14 @@ fn set_sbf_out_dir() {
     std::env::set_var("SBF_OUT_DIR", deploy_dir);
 }
 
-/// Build a fake SlotHashes sysvar account with one entry.
-fn build_slot_hashes_account(slot: u64, hash: [u8; 32]) -> Account {
-    // Format: [count: u64 LE] [entry: (slot: u64 LE, hash: [u8; 32])...]
-    let mut data = Vec::with_capacity(48);
-    data.extend_from_slice(&1u64.to_le_bytes()); // count = 1
-    data.extend_from_slice(&slot.to_le_bytes());
-    data.extend_from_slice(&hash);
-
+/// Build a fake SlotHashes sysvar account with N entries.
+fn build_slot_hashes_account(entries: &[(u64, [u8; 32])]) -> Account {
+    let mut data = Vec::with_capacity(8 + entries.len() * 40);
+    data.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (slot, hash) in entries {
+        data.extend_from_slice(&slot.to_le_bytes());
+        data.extend_from_slice(hash);
+    }
     Account {
         lamports: 1,
         data,
@@ -47,28 +47,172 @@ fn build_slot_hashes_account(slot: u64, hash: [u8; 32]) -> Account {
     }
 }
 
+fn build_instruction(program_id: Pubkey) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![AccountMeta::new_readonly(
+            Pubkey::from(SLOT_HASHES_BYTES),
+            false,
+        )],
+        data: LOG_RECENT_HASH_DISC.to_vec(),
+    }
+}
+
+// ── On-chain (SBF) tests via Mollusk ──
+
 #[test]
-fn test_log_recent_hash() {
+fn test_single_entry() {
     set_sbf_out_dir();
 
     let program_id = Pubkey::from(PROGRAM_ID_BYTES);
     let mollusk = Mollusk::new(&program_id, "recent_blockhash");
-
     let slot_hashes_key = Pubkey::from(SLOT_HASHES_BYTES);
 
-    let test_slot: u64 = 12345;
-    let test_hash: [u8; 32] = [0xAB; 32];
-    let slot_hashes_account = build_slot_hashes_account(test_slot, test_hash);
-
-    let instruction = Instruction {
-        program_id,
-        accounts: vec![AccountMeta::new_readonly(slot_hashes_key, false)],
-        data: LOG_RECENT_HASH_DISC.to_vec(),
-    };
+    let account = build_slot_hashes_account(&[(12345, [0xAB; 32])]);
 
     mollusk.process_and_validate_instruction(
-        &instruction,
-        &[(slot_hashes_key, slot_hashes_account)],
+        &build_instruction(program_id),
+        &[(slot_hashes_key, account)],
         &[Check::success()],
     );
+}
+
+#[test]
+fn test_multiple_entries_reads_most_recent() {
+    set_sbf_out_dir();
+
+    let program_id = Pubkey::from(PROGRAM_ID_BYTES);
+    let mollusk = Mollusk::new(&program_id, "recent_blockhash");
+    let slot_hashes_key = Pubkey::from(SLOT_HASHES_BYTES);
+
+    let account =
+        build_slot_hashes_account(&[(300, [0xCC; 32]), (200, [0xBB; 32]), (100, [0xAA; 32])]);
+
+    mollusk.process_and_validate_instruction(
+        &build_instruction(program_id),
+        &[(slot_hashes_key, account)],
+        &[Check::success()],
+    );
+}
+
+#[test]
+fn test_empty_sysvar_fails() {
+    set_sbf_out_dir();
+
+    let program_id = Pubkey::from(PROGRAM_ID_BYTES);
+    let mollusk = Mollusk::new(&program_id, "recent_blockhash");
+    let slot_hashes_key = Pubkey::from(SLOT_HASHES_BYTES);
+
+    // count = 0, no entries
+    let account = build_slot_hashes_account(&[]);
+
+    // count=0 is structurally valid, but most_recent() hits IndexOutOfBounds (6002)
+    mollusk.process_and_validate_instruction(
+        &build_instruction(program_id),
+        &[(slot_hashes_key, account)],
+        &[Check::err(solana_program_error::ProgramError::Custom(6002))],
+    );
+}
+
+#[test]
+fn test_truncated_data_fails() {
+    set_sbf_out_dir();
+
+    let program_id = Pubkey::from(PROGRAM_ID_BYTES);
+    let mollusk = Mollusk::new(&program_id, "recent_blockhash");
+    let slot_hashes_key = Pubkey::from(SLOT_HASHES_BYTES);
+
+    // count says 1 entry but data is too short
+    let mut data = Vec::new();
+    data.extend_from_slice(&1u64.to_le_bytes());
+    data.extend_from_slice(&[0u8; 20]); // 20 bytes, need 40
+    let account = Account {
+        lamports: 1,
+        data,
+        owner: Pubkey::from(SLOT_HASHES_BYTES),
+        executable: false,
+        rent_epoch: 0,
+    };
+
+    // Anchor error 6001 = InvalidData → ProgramError::Custom(6001)
+    mollusk.process_and_validate_instruction(
+        &build_instruction(program_id),
+        &[(slot_hashes_key, account)],
+        &[Check::err(solana_program_error::ProgramError::Custom(6001))],
+    );
+}
+
+// ── Unit tests for SlotHashesReader (no SBF, pure Rust) ──
+
+use recent_blockhash::SlotHashesReader;
+
+fn make_sysvar_bytes(entries: &[(u64, [u8; 32])]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + entries.len() * 40);
+    data.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (slot, hash) in entries {
+        data.extend_from_slice(&slot.to_le_bytes());
+        data.extend_from_slice(hash);
+    }
+    data
+}
+
+#[test]
+fn reader_parses_single_entry() {
+    let data = make_sysvar_bytes(&[(42, [0xFF; 32])]);
+    let reader = SlotHashesReader::new(&data).unwrap();
+
+    assert_eq!(reader.count(), 1);
+    let entry = reader.most_recent().unwrap();
+    assert_eq!(entry.slot, 42);
+    assert_eq!(entry.hash, [0xFF; 32]);
+}
+
+#[test]
+fn reader_parses_multiple_and_indexes_correctly() {
+    let entries = [(300, [0xCC; 32]), (200, [0xBB; 32]), (100, [0xAA; 32])];
+    let data = make_sysvar_bytes(&entries);
+    let reader = SlotHashesReader::new(&data).unwrap();
+
+    assert_eq!(reader.count(), 3);
+
+    let e0 = reader.get(0).unwrap();
+    assert_eq!(e0.slot, 300);
+    assert_eq!(e0.hash, [0xCC; 32]);
+
+    let e1 = reader.get(1).unwrap();
+    assert_eq!(e1.slot, 200);
+    assert_eq!(e1.hash, [0xBB; 32]);
+
+    let e2 = reader.get(2).unwrap();
+    assert_eq!(e2.slot, 100);
+    assert_eq!(e2.hash, [0xAA; 32]);
+}
+
+#[test]
+fn reader_rejects_empty_data() {
+    assert!(SlotHashesReader::new(&[]).is_err());
+}
+
+#[test]
+fn reader_zero_count_rejects_most_recent() {
+    let data = make_sysvar_bytes(&[]);
+    let reader = SlotHashesReader::new(&data).unwrap();
+    assert_eq!(reader.count(), 0);
+    assert!(reader.most_recent().is_err());
+}
+
+#[test]
+fn reader_rejects_truncated_data() {
+    let mut data = Vec::new();
+    data.extend_from_slice(&1u64.to_le_bytes());
+    data.extend_from_slice(&[0u8; 20]); // too short for one entry
+    assert!(SlotHashesReader::new(&data).is_err());
+}
+
+#[test]
+fn reader_rejects_out_of_bounds_index() {
+    let data = make_sysvar_bytes(&[(1, [0xAA; 32])]);
+    let reader = SlotHashesReader::new(&data).unwrap();
+    assert!(reader.get(1).is_err());
+    assert!(reader.get(999).is_err());
 }
