@@ -153,32 +153,32 @@ const rateSkipped = new RateTracker();
 // ─── SQLite layer ───────────────────────────────────────────────────────────
 
 const dbPath = `reorg-monitor-${cluster}.db`;
-const db = new Database(dbPath);
-db.exec("PRAGMA journal_mode=WAL;");
+const db = new Database(dbPath, { readonly: VERIFY_MODE });
+if (!VERIFY_MODE) db.exec("PRAGMA journal_mode=WAL;");
 
-db.exec(`
-	CREATE TABLE IF NOT EXISTS stats (
-		key TEXT PRIMARY KEY,
-		value INTEGER NOT NULL
-	);
-	CREATE TABLE IF NOT EXISTS cursor (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		last_finalized_slot INTEGER NOT NULL,
-		last_run_at TEXT NOT NULL
-	);
-	CREATE TABLE IF NOT EXISTS fork_events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		slot INTEGER NOT NULL,
-		detected_at TEXT NOT NULL,
-		type TEXT NOT NULL,
-		parent_expected INTEGER,
-		parent_actual INTEGER,
-		detail TEXT NOT NULL
-	);
-`);
+if (!VERIFY_MODE) {
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS stats (
+			key TEXT PRIMARY KEY,
+			value INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS cursor (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			last_finalized_slot INTEGER NOT NULL,
+			last_run_at TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS fork_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			slot INTEGER NOT NULL,
+			detected_at TEXT NOT NULL,
+			type TEXT NOT NULL,
+			parent_expected INTEGER,
+			parent_actual INTEGER,
+			detail TEXT NOT NULL
+		);
+	`);
 
-// Migration: add first_monitored_slot column if missing
-{
+	// Migration: add first_monitored_slot column if missing
 	const cols = db.prepare("PRAGMA table_info(cursor)").all() as Array<{ name: string }>;
 	if (!cols.some((c) => c.name === "first_monitored_slot")) {
 		db.exec("ALTER TABLE cursor ADD COLUMN first_monitored_slot INTEGER");
@@ -196,15 +196,19 @@ const STAT_KEYS = [
 	"total_skipped",
 ] as const;
 
-// Initialize missing stat rows
-const upsertStat = db.prepare(
-	"INSERT INTO stats (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
-);
-for (const key of STAT_KEYS) {
-	const row = db.prepare("SELECT value FROM stats WHERE key = ?").get(key) as {
-		value: number;
-	} | null;
-	if (!row) upsertStat.run(key, 0, 0);
+// Initialize missing stat rows (skip in verify mode — DB is readonly)
+const upsertStat = VERIFY_MODE
+	? null
+	: db.prepare(
+			"INSERT INTO stats (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+		);
+if (!VERIFY_MODE) {
+	for (const key of STAT_KEYS) {
+		const row = db.prepare("SELECT value FROM stats WHERE key = ?").get(key) as {
+			value: number;
+		} | null;
+		if (!row) upsertStat?.run(key, 0, 0);
+	}
 }
 
 // Load persisted stats into session
@@ -266,6 +270,7 @@ function loadCursor(): { lastFinalized: bigint; firstMonitored: bigint | null } 
 let firstMonitoredSlot: bigint | null = null;
 
 function flushToDb(): void {
+	if (!upsertStat) return; // readonly / verify mode
 	const tx = db.transaction(() => {
 		upsertStat.run("total_processed", stats.totalProcessed, stats.totalProcessed);
 		upsertStat.run("total_confirmed", stats.totalConfirmed, stats.totalConfirmed);
