@@ -466,14 +466,14 @@ function handleSlotUpdate(notification: {
 
 // ─── Maintenance (prune + drop detection) ───────────────────────────────────
 
-function pruneSlotMap(): void {
+async function pruneSlotMap(): Promise<void> {
 	const now = Date.now();
 	const toDelete: bigint[] = [];
 
-	for (const [slot, rec] of slotMap) {
+	// Collect candidate drops: processed but no WS confirmation after timeout
+	const dropCandidates: SlotRecord[] = [];
+	for (const [, rec] of slotMap) {
 		const age = now - rec.firstSeen;
-
-		// Drop detection: processed but not confirmed/dead after timeout
 		if (
 			rec.sawProcessed &&
 			!rec.sawConfirmed &&
@@ -481,20 +481,49 @@ function pruneSlotMap(): void {
 			!rec.dropCounted &&
 			age > DROP_TIMEOUT_MS
 		) {
-			rec.dropCounted = true;
-			stats.totalDropped++;
-			rateDropped.record();
-			const evt: ForkEvent = {
-				slot: rec.slot,
-				detectedAt: now,
-				type: "slot_drop",
-				parentExpected: rec.parentFromSlotSubscribe,
-				parentActual: null,
-				detail: `Slot ${rec.slot} processed but never confirmed after ${DROP_TIMEOUT_MS / 1000}s`,
-			};
-			pendingForkEvents.push(evt);
-			addRecent("DROP", `Slot ${fmt(rec.slot)} never confirmed`);
+			dropCandidates.push(rec);
 		}
+	}
+
+	// Batch-verify candidates against chain via getBlocks before classifying
+	if (dropCandidates.length > 0) {
+		const candidateSlots = dropCandidates.map((r) => r.slot).sort();
+		const rangeStart = candidateSlots[0];
+		const rangeEnd = candidateSlots[candidateSlots.length - 1];
+		let confirmedOnChain = new Set<bigint>();
+		try {
+			const blocks = await rpc.getBlocks(rangeStart, rangeEnd, { commitment: "confirmed" }).send();
+			confirmedOnChain = new Set(blocks);
+		} catch {
+			// If RPC fails, skip drop detection this cycle rather than create false positives
+		}
+
+		for (const rec of dropCandidates) {
+			if (confirmedOnChain.has(rec.slot)) {
+				// Chain confirmed this slot — WS event was just missed
+				rec.sawConfirmed = true;
+				stats.totalConfirmed++;
+				rateConfirmed.record();
+			} else {
+				rec.dropCounted = true;
+				stats.totalDropped++;
+				rateDropped.record();
+				const evt: ForkEvent = {
+					slot: rec.slot,
+					detectedAt: now,
+					type: "slot_drop",
+					parentExpected: rec.parentFromSlotSubscribe,
+					parentActual: null,
+					detail: `Slot ${rec.slot} processed but not confirmed on chain after ${DROP_TIMEOUT_MS / 1000}s`,
+				};
+				pendingForkEvents.push(evt);
+				addRecent("DROP", `Slot ${fmt(rec.slot)} never confirmed`);
+			}
+		}
+	}
+
+	for (const [slot, rec] of slotMap) {
+		const age = now - rec.firstSeen;
 
 		// Confirmed but never finalized (after finalize window)
 		if (rec.sawConfirmed && !rec.sawFinalized && !rec.isDead && age > PRUNE_FINALIZED_AGE_MS) {
@@ -879,7 +908,7 @@ async function main(): Promise<void> {
 	// Periodic tasks
 	const pollTimer = setInterval(async () => {
 		await pollCommitmentLevels();
-		pruneSlotMap();
+		await pruneSlotMap();
 	}, POLL_INTERVAL_MS);
 
 	const dashTimer = setInterval(() => {
