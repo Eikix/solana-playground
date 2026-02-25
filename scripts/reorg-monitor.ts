@@ -8,9 +8,11 @@
  *   SOLANA_CLUSTER=mainnet-beta bun run monitor
  *   SOLANA_CLUSTER=devnet bun run monitor
  *   SOLANA_CLUSTER=devnet bun run monitor --verify   # backtest last run against chain
+ *   SOLANA_CLUSTER=devnet bun run monitor --reset   # clear stats and start fresh
  */
 
 const VERIFY_MODE = process.argv.includes("--verify");
+const RESET_MODE = process.argv.includes("--reset");
 
 import { Database } from "bun:sqlite";
 import {
@@ -183,6 +185,11 @@ if (!VERIFY_MODE) {
 	if (!cols.some((c) => c.name === "first_monitored_slot")) {
 		db.exec("ALTER TABLE cursor ADD COLUMN first_monitored_slot INTEGER");
 	}
+}
+
+if (RESET_MODE) {
+	db.exec("DELETE FROM stats; DELETE FROM cursor; DELETE FROM fork_events;");
+	console.log(`Reset: cleared all data in ${dbPath}`);
 }
 
 const STAT_KEYS = [
