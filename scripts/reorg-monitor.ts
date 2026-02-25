@@ -733,22 +733,23 @@ async function runVerification(): Promise<void> {
 
 	console.log("\n─── Step 3: Reconciliation ───");
 
-	// Compare our dead/dropped count vs chain's missing slots
+	// Compare dead+dropped against chain's missing slots.
+	// "Skipped" (WS sequence gaps) is reported separately — it's unreliable because
+	// slotNotification can batch/skip sequence numbers without meaning the chain skipped.
 	const ourDeadDropped = stats.totalDead + stats.totalDropped;
-	const ourSkipped = stats.totalSkipped;
 	const chainMissing = missingSlots.length;
 
 	console.log("  Monitor recorded:");
 	console.log(`    Dead:    ${fmtNum(stats.totalDead)}`);
 	console.log(`    Dropped: ${fmtNum(stats.totalDropped)}`);
-	console.log(`    Skipped: ${fmtNum(stats.totalSkipped)}`);
-	console.log(`    Total non-confirmed: ${fmtNum(ourDeadDropped + ourSkipped)}`);
+	console.log(`    Dead + Dropped: ${fmtNum(ourDeadDropped)}`);
+	console.log(`    Skipped (WS gaps, unreliable): ${fmtNum(stats.totalSkipped)}`);
 	console.log("  Chain reports:");
 	console.log(`    Missing from confirmed: ${fmtNum(chainMissing)}`);
 
-	const diff = chainMissing - (ourDeadDropped + ourSkipped);
+	const diff = chainMissing - ourDeadDropped;
 	if (diff === 0) {
-		console.log("\n  MATCH — Monitor and chain agree exactly.");
+		console.log("\n  MATCH — Monitor dead+dropped count matches chain exactly.");
 	} else if (diff > 0) {
 		console.log(
 			`\n  DISCREPANCY — Chain has ${fmtNum(diff)} more missing slots than monitor recorded.`,
@@ -758,7 +759,7 @@ async function runVerification(): Promise<void> {
 		);
 	} else {
 		console.log(
-			`\n  DISCREPANCY — Monitor recorded ${fmtNum(-diff)} more events than chain shows missing.`,
+			`\n  DISCREPANCY — Monitor recorded ${fmtNum(-diff)} more dead+dropped than chain shows missing.`,
 		);
 		console.log(
 			"  Possible causes: slots confirmed after we classified them as dropped (timeout too short).",
