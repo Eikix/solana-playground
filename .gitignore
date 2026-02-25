@@ -13,4 +13,8 @@ bun.lockb
 # OS
 .DS_Store
 
+# Reorg monitor runtime data
+reorg-monitor-*.db
+reorg-summary-*.json
+
 # IDL build artifacts are tracked, but deploy keypairs are not
