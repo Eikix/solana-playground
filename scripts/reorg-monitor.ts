@@ -153,7 +153,7 @@ const rateSkipped = new RateTracker();
 // ─── SQLite layer ───────────────────────────────────────────────────────────
 
 const dbPath = `reorg-monitor-${cluster}.db`;
-const db = new Database(dbPath, { readonly: VERIFY_MODE });
+const db = VERIFY_MODE ? new Database(dbPath, { readonly: true }) : new Database(dbPath);
 if (!VERIFY_MODE) db.exec("PRAGMA journal_mode=WAL;");
 
 if (!VERIFY_MODE) {
