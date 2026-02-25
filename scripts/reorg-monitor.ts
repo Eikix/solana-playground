@@ -106,9 +106,9 @@ const stats: SessionStats = {
 	totalSkipped: 0,
 };
 
-let pollProcessed: bigint = 0n;
-let pollConfirmed: bigint = 0n;
-let pollFinalized: bigint = 0n;
+let pollProcessed: bigint | null = null;
+let pollConfirmed: bigint | null = null;
+let pollFinalized: bigint | null = null;
 let lastSeenSlot: bigint = 0n;
 const startTime = Date.now();
 
@@ -284,7 +284,7 @@ function flushToDb(): void {
 		);
 		upsertStat.run("total_skipped", stats.totalSkipped, stats.totalSkipped);
 
-		if (pollFinalized > 0n) {
+		if (pollFinalized != null) {
 			db.prepare(
 				"INSERT INTO cursor (id, last_finalized_slot, last_run_at, first_monitored_slot) " +
 					"VALUES (1, ?, ?, ?) " +
@@ -294,7 +294,7 @@ function flushToDb(): void {
 			).run(
 				Number(pollFinalized),
 				new Date().toISOString(),
-				firstMonitoredSlot != null && firstMonitoredSlot > 0n ? Number(firstMonitoredSlot) : null,
+				firstMonitoredSlot != null ? Number(firstMonitoredSlot) : null,
 			);
 		}
 
@@ -565,14 +565,17 @@ function pct(part: number, total: number): string {
 function formatDashboard(): string {
 	const W = 65;
 	const bar = "=".repeat(W);
-	const gapPC = pollProcessed > 0n ? Number(pollProcessed - pollConfirmed) : 0;
-	const gapCF = pollConfirmed > 0n ? Number(pollConfirmed - pollFinalized) : 0;
+	const p = pollProcessed ?? 0n;
+	const c = pollConfirmed ?? 0n;
+	const f = pollFinalized ?? 0n;
+	const gapPC = pollProcessed != null ? Number(p - c) : 0;
+	const gapCF = pollConfirmed != null ? Number(c - f) : 0;
 
 	const lines: string[] = [
 		bar,
 		`  SOLANA REORG MONITOR    Cluster: ${cluster}    ${elapsed()}`,
 		bar,
-		`  Processed: ${fmt(pollProcessed)}   Confirmed: ${fmt(pollConfirmed)}   Finalized: ${fmt(pollFinalized)}`,
+		`  Processed: ${fmt(p)}   Confirmed: ${fmt(c)}   Finalized: ${fmt(f)}`,
 		`  Gaps: proc→conf: ${gapPC}      conf→final: ${gapCF}`,
 		"",
 		"  LIFECYCLE          COUNT       RATE (/s)    SESSION %",
@@ -822,9 +825,9 @@ async function main(): Promise<void> {
 	console.log(`WS:  ${CLUSTER_WS_URLS[cluster]}`);
 	console.log(`DB:  ${dbPath}`);
 
-	// Initial poll — retry until we get a valid finalized slot
+	// Initial poll — must succeed to establish baseline
 	await pollCommitmentLevels();
-	if (pollFinalized === 0n) {
+	if (pollFinalized == null) {
 		console.error("Failed to fetch initial slot from RPC. Check your connection and cluster.");
 		db.close();
 		process.exit(1);
@@ -886,18 +889,21 @@ async function main(): Promise<void> {
 		flushToDb();
 
 		// JSON export
+		const p = pollProcessed ?? 0n;
+		const c = pollConfirmed ?? 0n;
+		const f = pollFinalized ?? 0n;
 		const summary = {
 			cluster,
 			runDuration: elapsed(),
 			stats: { ...stats },
 			pollSlots: {
-				processed: Number(pollProcessed),
-				confirmed: Number(pollConfirmed),
-				finalized: Number(pollFinalized),
+				processed: Number(p),
+				confirmed: Number(c),
+				finalized: Number(f),
 			},
 			gaps: {
-				processedToConfirmed: Number(pollProcessed - pollConfirmed),
-				confirmedToFinalized: Number(pollConfirmed - pollFinalized),
+				processedToConfirmed: Number(p - c),
+				confirmedToFinalized: Number(c - f),
 			},
 			recentEvents: recentEvents.map((e) => ({
 				time: new Date(e.time).toISOString(),
