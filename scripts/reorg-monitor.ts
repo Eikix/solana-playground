@@ -294,7 +294,7 @@ function flushToDb(): void {
 			).run(
 				Number(pollFinalized),
 				new Date().toISOString(),
-				firstMonitoredSlot != null ? Number(firstMonitoredSlot) : null,
+				firstMonitoredSlot != null && firstMonitoredSlot > 0n ? Number(firstMonitoredSlot) : null,
 			);
 		}
 
@@ -461,8 +461,7 @@ function pruneSlotMap(): void {
 	for (const [slot, rec] of slotMap) {
 		const age = now - rec.firstSeen;
 
-		// Drop detection: processed but not confirmed after timeout
-		// Cross-check against pollConfirmed to avoid false positives from missed WS events
+		// Drop detection: processed but not confirmed/dead after timeout
 		if (
 			rec.sawProcessed &&
 			!rec.sawConfirmed &&
@@ -470,26 +469,19 @@ function pruneSlotMap(): void {
 			!rec.dropCounted &&
 			age > DROP_TIMEOUT_MS
 		) {
-			if (pollConfirmed > 0n && rec.slot <= pollConfirmed) {
-				// Chain has confirmed past this slot — we missed the WS event, not a real drop
-				rec.sawConfirmed = true;
-				stats.totalConfirmed++;
-				rateConfirmed.record();
-			} else {
-				rec.dropCounted = true;
-				stats.totalDropped++;
-				rateDropped.record();
-				const evt: ForkEvent = {
-					slot: rec.slot,
-					detectedAt: now,
-					type: "slot_drop",
-					parentExpected: rec.parentFromSlotSubscribe,
-					parentActual: null,
-					detail: `Slot ${rec.slot} processed but never confirmed after ${DROP_TIMEOUT_MS / 1000}s`,
-				};
-				pendingForkEvents.push(evt);
-				addRecent("DROP", `Slot ${fmt(rec.slot)} never confirmed`);
-			}
+			rec.dropCounted = true;
+			stats.totalDropped++;
+			rateDropped.record();
+			const evt: ForkEvent = {
+				slot: rec.slot,
+				detectedAt: now,
+				type: "slot_drop",
+				parentExpected: rec.parentFromSlotSubscribe,
+				parentActual: null,
+				detail: `Slot ${rec.slot} processed but never confirmed after ${DROP_TIMEOUT_MS / 1000}s`,
+			};
+			pendingForkEvents.push(evt);
+			addRecent("DROP", `Slot ${fmt(rec.slot)} never confirmed`);
 		}
 
 		// Confirmed but never finalized (after finalize window)
@@ -829,8 +821,13 @@ async function main(): Promise<void> {
 	console.log(`WS:  ${CLUSTER_WS_URLS[cluster]}`);
 	console.log(`DB:  ${dbPath}`);
 
-	// Initial poll
+	// Initial poll — retry until we get a valid finalized slot
 	await pollCommitmentLevels();
+	if (pollFinalized === 0n) {
+		console.error("Failed to fetch initial slot from RPC. Check your connection and cluster.");
+		db.close();
+		process.exit(1);
+	}
 	if (firstMonitoredSlot === null) firstMonitoredSlot = pollFinalized;
 	console.log(`Current finalized slot: ${fmt(pollFinalized)}`);
 
@@ -874,7 +871,11 @@ async function main(): Promise<void> {
 	}, DASHBOARD_INTERVAL_MS);
 
 	// Graceful shutdown
-	const shutdown = () => {
+	let shuttingDown = false;
+	const shutdown = async () => {
+		if (shuttingDown) return;
+		shuttingDown = true;
+
 		console.log("\nShutting down...");
 		clearInterval(pollTimer);
 		clearInterval(dashTimer);
@@ -904,7 +905,7 @@ async function main(): Promise<void> {
 			})),
 		};
 		const jsonPath = `reorg-summary-${cluster}-${Date.now()}.json`;
-		Bun.write(jsonPath, JSON.stringify(summary, null, 2));
+		await Bun.write(jsonPath, JSON.stringify(summary, null, 2));
 		console.log(`Summary exported to ${jsonPath}`);
 
 		db.close();
