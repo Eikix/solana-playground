@@ -68,6 +68,7 @@ interface SlotRecord {
 	isDead: boolean;
 	deadReason: string | null;
 	dropCounted: boolean;
+	isGapSlot: boolean;
 }
 
 interface ForkEvent {
@@ -346,6 +347,7 @@ function getOrCreateSlot(slot: bigint): SlotRecord {
 			isDead: false,
 			deadReason: null,
 			dropCounted: false,
+			isGapSlot: false,
 		};
 		slotMap.set(slot, rec);
 	}
@@ -397,13 +399,22 @@ function handleSlotNotification(notification: {
 	}
 	rec.parentFromSlotSubscribe = notification.parent;
 	if (notification.slot > lastSeenSlot) {
-		// Detect skipped slots
+		// Detect skipped slots — create records so prune cycle can verify via getBlocks
 		if (lastSeenSlot > 0n) {
 			const gap = notification.slot - lastSeenSlot - 1n;
-			if (gap > 0n) {
+			if (gap > 0n && gap <= 100n) {
+				// Cap at 100 to avoid flooding on reconnection gaps
 				const gapNum = Number(gap);
 				stats.totalSkipped += gapNum;
 				for (let i = 0; i < gapNum; i++) rateSkipped.record();
+				for (let s = lastSeenSlot + 1n; s < notification.slot; s++) {
+					const skipped = getOrCreateSlot(s);
+					skipped.sawProcessed = true;
+					skipped.isGapSlot = true;
+				}
+			} else if (gap > 100n) {
+				// Large gap likely from WS reconnection, just count
+				stats.totalSkipped += Number(gap);
 			}
 		}
 		lastSeenSlot = notification.slot;
@@ -500,10 +511,12 @@ async function pruneSlotMap(): Promise<void> {
 
 		for (const rec of dropCandidates) {
 			if (confirmedOnChain.has(rec.slot)) {
-				// Chain confirmed this slot — WS event was just missed
+				// Chain confirmed this slot — WS event was missed or it was a gap slot
 				rec.sawConfirmed = true;
-				stats.totalConfirmed++;
-				rateConfirmed.record();
+				if (!rec.isGapSlot) {
+					stats.totalConfirmed++;
+					rateConfirmed.record();
+				}
 			} else {
 				rec.dropCounted = true;
 				stats.totalDropped++;
