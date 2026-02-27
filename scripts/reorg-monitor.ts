@@ -102,14 +102,21 @@ function initProviders(): ProviderConfig[] {
 		}
 	}
 
-	// Fallback to cluster default
+	// Fallback: for mainnet-beta use known free providers; others get cluster default
 	if (result.length === 0) {
-		result.push({
-			name: "provider-0",
-			rpcUrl: CLUSTER_URLS[cluster],
-			wsUrl: CLUSTER_WS_URLS[cluster],
-			rpc: createSolanaRpc(CLUSTER_URLS[cluster]),
-		});
+		const defaults =
+			cluster === "mainnet-beta"
+				? [
+						{ name: "publicnode", url: "https://solana-rpc.publicnode.com" },
+						{ name: "vibe-station", url: "https://public.rpc.solanavibestation.com" },
+						{ name: "subquery", url: "https://solana.rpc.subquery.network/public" },
+					]
+				: [{ name: "provider-0", url: CLUSTER_URLS[cluster] }];
+
+		for (const d of defaults) {
+			const wsUrl = cluster !== "mainnet-beta" ? CLUSTER_WS_URLS[cluster] : deriveWsUrl(d.url);
+			result.push({ name: d.name, rpcUrl: d.url, wsUrl, rpc: createSolanaRpc(d.url) });
+		}
 	}
 
 	return result;
@@ -130,8 +137,8 @@ const PRUNE_DROPPED_AGE_MS = 60_000;
 const POLL_INTERVAL_MS = 5_000;
 const DASHBOARD_INTERVAL_MS = 2_000;
 const RECONNECT_DELAY_MS = 2_000;
-const MAX_GETBLOCK_PER_CYCLE = 30;
 const TTR_MAX_SAMPLES = 1_000;
+const OBS_FRESHNESS_MS = 15_000; // M2: only compare observations this fresh
 const GAP_TREND_WINDOW = 12; // 1 minute at 5s interval
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -248,7 +255,6 @@ let currentHour = new Date().getHours();
 
 // Blockhash polling state
 let lastPolledConfirmedSlot: bigint | null = null;
-let pollCycleCount = 0;
 let maxDivergenceDurationMs = 0;
 
 // ─── Rate tracker ───────────────────────────────────────────────────────────
@@ -280,6 +286,48 @@ class RateTracker {
 		return this.buckets.length / (elapsed / 1000);
 	}
 }
+
+// ─── Adaptive rate controller (per provider) ────────────────────────────────
+
+class AdaptiveRateController {
+	private tokensPerCycle: number;
+	private consecutiveClean = 0;
+	total429s = 0;
+
+	constructor(
+		private readonly minTokens: number,
+		private readonly maxTokens: number,
+		initialTokens: number,
+	) {
+		this.tokensPerCycle = initialTokens;
+	}
+
+	/** How many getBlock calls this provider may use this cycle */
+	getTokens(): number {
+		return Math.floor(this.tokensPerCycle);
+	}
+
+	/** Call after each cycle with results for this provider */
+	reportCycle(successes: number, failures429: number): void {
+		if (failures429 > 0) {
+			// Multiplicative decrease
+			this.tokensPerCycle = Math.max(this.minTokens, this.tokensPerCycle * 0.5);
+			this.consecutiveClean = 0;
+			this.total429s += failures429;
+		} else if (successes > 0) {
+			this.consecutiveClean++;
+			// Additive increase after 2 clean cycles
+			if (this.consecutiveClean >= 2) {
+				this.tokensPerCycle = Math.min(this.maxTokens, this.tokensPerCycle + 2);
+			}
+		}
+	}
+}
+
+// Per-provider rate controllers: start at 15 tokens/cycle (3 req/s), ramp up to 75 (15 req/s)
+const rateControllers: AdaptiveRateController[] = providers.map(
+	() => new AdaptiveRateController(2, 75, 15),
+);
 
 const rateProcessed = new RateTracker();
 const rateConfirmed = new RateTracker();
@@ -642,14 +690,19 @@ function analyzeSlot(slot: bigint): void {
 	const rec = slotMap.get(slot);
 	if (!rec) return;
 
-	// Get latest blockhash from each provider that has observations
+	// Get latest blockhash from each provider — only if observation is fresh
+	const now = Date.now();
 	const latestHashes = new Map<number, string>();
 	for (const [provIdx, history] of rec.observations) {
 		if (history.length > 0) {
-			latestHashes.set(provIdx, history[history.length - 1].blockhash);
+			const latest = history[history.length - 1];
+			if (now - latest.fetchedAt <= OBS_FRESHNESS_MS) {
+				latestHashes.set(provIdx, latest.blockhash);
+			}
 		}
 	}
 
+	// Need at least 2 fresh observations to compare
 	if (latestHashes.size < 2) return;
 
 	const uniqueHashes = new Set(latestHashes.values());
@@ -684,81 +737,111 @@ function analyzeSlot(slot: bigint): void {
 
 // ─── Blockhash polling loop ─────────────────────────────────────────────────
 
-async function blockhashPollCycle(): Promise<void> {
-	pollCycleCount++;
+function collectUnfinalizedSlots(beforeSlot: bigint): bigint[] {
+	const result: bigint[] = [];
+	for (const [slot, rec] of slotMap) {
+		if (!rec.sawFinalized && !rec.isDead && !rec.dropCounted && slot <= beforeSlot) {
+			result.push(slot);
+		}
+	}
+	// Shuffle for random sampling
+	for (let i = result.length - 1; i > 0; i--) {
+		const j = Math.floor(Math.random() * (i + 1));
+		[result[i], result[j]] = [result[j], result[i]];
+	}
+	return result;
+}
 
+async function fetchBlock(
+	providerIdx: number,
+	slot: bigint,
+): Promise<{ ok: boolean; rateLimited: boolean }> {
+	try {
+		const block = await providers[providerIdx].rpc
+			.getBlock(slot, {
+				transactionDetails: "none",
+				commitment: "confirmed",
+				maxSupportedTransactionVersion: 0,
+			})
+			.send();
+		if (block != null) {
+			recordObservation(slot, providerIdx, {
+				blockhash: block.blockhash,
+				parentSlot: block.parentSlot,
+				previousBlockhash: block.previousBlockhash,
+				fetchedAt: Date.now(),
+			});
+		}
+		providerHealthMap[providerIdx].lastSuccess = Date.now();
+		providerHealthMap[providerIdx].consecutiveErrors = 0;
+		return { ok: true, rateLimited: false };
+	} catch (err) {
+		providerHealthMap[providerIdx].consecutiveErrors++;
+		const is429 = String(err).includes("429") || String(err).includes("Too many requests");
+		return { ok: false, rateLimited: is429 };
+	}
+}
+
+async function blockhashPollCycle(): Promise<void> {
 	if (pollConfirmed == null) return;
 
 	const currentConfirmed = pollConfirmed;
 	const prevPolled = lastPolledConfirmedSlot ?? currentConfirmed;
-
-	// New slots since last poll
 	const newSlotCount = currentConfirmed > prevPolled ? Number(currentConfirmed - prevPolled) : 0;
 
-	// Build fetch queue: new slots (all providers), then re-checks
-	const fetchQueue: Array<{ slot: bigint; providerIdx: number }> = [];
-
-	// New slots — fetch from all providers
-	const maxNew = Math.min(newSlotCount, 20);
-	for (let i = 0; i < maxNew; i++) {
-		const slot = prevPolled + BigInt(i + 1);
-		for (let p = 0; p < providers.length; p++) {
-			fetchQueue.push({ slot, providerIdx: p });
-		}
+	// Build new-slot list (most recent first for priority)
+	const newSlots: bigint[] = [];
+	for (let i = 0; i < Math.min(newSlotCount, 50); i++) {
+		newSlots.push(prevPolled + BigInt(i + 1));
 	}
 
-	// Every 3rd cycle, re-check older unfinalized slots
-	if (pollCycleCount % 3 === 0 && pollFinalized != null) {
-		const unfinalizedSlots: bigint[] = [];
-		for (const [slot, rec] of slotMap) {
-			if (!rec.sawFinalized && !rec.isDead && !rec.dropCounted && slot <= prevPolled) {
-				unfinalizedSlots.push(slot);
-			}
-		}
-		const remaining = MAX_GETBLOCK_PER_CYCLE - fetchQueue.length;
-		const sampleSize = Math.max(0, Math.floor(remaining / providers.length));
-		// Shuffle and take sample
-		for (let i = unfinalizedSlots.length - 1; i > 0; i--) {
-			const j = Math.floor(Math.random() * (i + 1));
-			[unfinalizedSlots[i], unfinalizedSlots[j]] = [unfinalizedSlots[j], unfinalizedSlots[i]];
-		}
-		const sample = unfinalizedSlots.slice(0, sampleSize);
-		for (const slot of sample) {
-			for (let p = 0; p < providers.length; p++) {
-				fetchQueue.push({ slot, providerIdx: p });
-			}
-		}
-	}
+	// Pre-collect re-check candidates (shuffled)
+	const recheckSlots = collectUnfinalizedSlots(prevPolled);
 
-	// Cap to budget
-	const queue = fetchQueue.slice(0, MAX_GETBLOCK_PER_CYCLE);
-
-	// Execute fetches concurrently
-	await Promise.all(
-		queue.map(async ({ slot, providerIdx }) => {
-			try {
-				const block = await providers[providerIdx].rpc
-					.getBlock(slot, {
-						transactionDetails: "none",
-						commitment: "confirmed",
-						maxSupportedTransactionVersion: 0,
-					})
-					.send();
-				if (block != null) {
-					recordObservation(slot, providerIdx, {
-						blockhash: block.blockhash,
-						parentSlot: block.parentSlot,
-						previousBlockhash: block.previousBlockhash,
-						fetchedAt: Date.now(),
-					});
-					providerHealthMap[providerIdx].lastSuccess = Date.now();
-					providerHealthMap[providerIdx].consecutiveErrors = 0;
-				}
-			} catch {
-				providerHealthMap[providerIdx].consecutiveErrors++;
-			}
-		}),
+	// Per-provider: split adaptive budget 60% new slots, 40% re-checks
+	const allFetches: Promise<{ ok: boolean; rateLimited: boolean }>[] = [];
+	const providerCycleCounts: Array<{ successes: number; failures429: number }> = providers.map(
+		() => ({ successes: 0, failures429: 0 }),
 	);
+
+	for (let p = 0; p < providers.length; p++) {
+		const budget = rateControllers[p].getTokens();
+		const newBudget = Math.ceil(budget * 0.6);
+		const recheckBudget = budget - newBudget;
+
+		// Queue new-slot fetches for this provider
+		const provNewSlots = newSlots.slice(0, newBudget);
+		// Queue re-check fetches for this provider
+		const provRecheckSlots = recheckSlots.slice(0, recheckBudget);
+
+		const providerIdx = p;
+		for (const slot of provNewSlots) {
+			allFetches.push(
+				fetchBlock(providerIdx, slot).then((r) => {
+					if (r.ok) providerCycleCounts[providerIdx].successes++;
+					if (r.rateLimited) providerCycleCounts[providerIdx].failures429++;
+					return r;
+				}),
+			);
+		}
+		for (const slot of provRecheckSlots) {
+			allFetches.push(
+				fetchBlock(providerIdx, slot).then((r) => {
+					if (r.ok) providerCycleCounts[providerIdx].successes++;
+					if (r.rateLimited) providerCycleCounts[providerIdx].failures429++;
+					return r;
+				}),
+			);
+		}
+	}
+
+	await Promise.all(allFetches);
+
+	// Feed results back to adaptive rate controllers
+	for (let p = 0; p < providers.length; p++) {
+		const c = providerCycleCounts[p];
+		rateControllers[p].reportCycle(c.successes, c.failures429);
+	}
 
 	lastPolledConfirmedSlot = currentConfirmed;
 }
@@ -822,12 +905,14 @@ function handleSlotUpdate(notification: {
 				rec.finalizedAt = Date.now();
 				stats.totalFinalized++;
 				rateFinalized.record();
-				// M4: Time to Root
-				const ttr = Date.now() - rec.firstSeenProcessed;
-				rec.timeToRootMs = ttr;
-				ttrSamples.push(ttr);
-				if (ttrSamples.length > TTR_MAX_SAMPLES) ttrSamples.shift();
-				if (ttr > stats.ttrMaxMs) stats.ttrMaxMs = ttr;
+				// M4: Time to Root — skip gap slots (synthetic firstSeenProcessed)
+				if (!rec.isGapSlot) {
+					const ttr = Date.now() - rec.firstSeenProcessed;
+					rec.timeToRootMs = ttr;
+					ttrSamples.push(ttr);
+					if (ttrSamples.length > TTR_MAX_SAMPLES) ttrSamples.shift();
+					if (ttr > stats.ttrMaxMs) stats.ttrMaxMs = ttr;
+				}
 			}
 			break;
 		case "dead":
@@ -928,13 +1013,12 @@ async function pruneSlotMap(): Promise<void> {
 
 	for (const slot of toDelete) {
 		slotMap.delete(slot);
-		// Close any open divergence for pruned slots
+		// Close any open divergence for pruned slots — don't count in max duration
+		// (duration would reflect prune age, not real convergence time)
 		const div = openDivergences.get(slot);
 		if (div && div.endedAt == null) {
 			div.endedAt = now;
 			div.convergedTo = "pruned";
-			const duration = div.endedAt - div.startedAt;
-			if (duration > maxDivergenceDurationMs) maxDivergenceDurationMs = duration;
 			pendingDivergenceEvents.push(div);
 			openDivergences.delete(slot);
 		}
@@ -1085,11 +1169,14 @@ function formatDashboard(): string {
 		`  HEALTH: Poll ${fmtAge(agePoll)} | WS-slot ${fmtAge(ageWsSlot)} | WS-update ${fmtAge(ageWsUpdate)}`,
 	);
 
-	// Provider health
+	// Provider health with adaptive rate info
 	const provParts = providers.map((prov, i) => {
 		const h = providerHealthMap[i];
+		const rc = rateControllers[i];
 		const status = h.consecutiveErrors > 3 ? "ERR" : h.lastSuccess > 0 ? "ok" : "waiting";
-		return `${prov.name} [${status}]`;
+		const tokens = rc.getTokens();
+		const errs = rc.total429s > 0 ? ` 429s:${rc.total429s}` : "";
+		return `${prov.name} [${status}] ${tokens}t/c${errs}`;
 	});
 	lines.push(`  PROVIDERS: ${provParts.join(" | ")}${stale ? "  !! STALE" : ""}`);
 	lines.push(bar);
