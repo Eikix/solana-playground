@@ -115,6 +115,13 @@ let pollFinalized: bigint | null = null;
 let lastSeenSlot: bigint = 0n;
 const startTime = Date.now();
 
+// Health tracking
+let lastPollSuccess = 0;
+let lastWsSlotEvent = 0;
+let lastWsUpdateEvent = 0;
+let wsSlotReconnects = 0;
+let wsUpdateReconnects = 0;
+
 // ─── Rate tracker ───────────────────────────────────────────────────────────
 
 class RateTracker {
@@ -391,6 +398,7 @@ function handleSlotNotification(notification: {
 	parent: bigint;
 	root: bigint;
 }): void {
+	lastWsSlotEvent = Date.now();
 	const rec = getOrCreateSlot(notification.slot);
 	if (!rec.sawProcessed) {
 		rec.sawProcessed = true;
@@ -435,6 +443,7 @@ function handleSlotUpdate(notification: {
 		maxTransactionsPerEntry: bigint;
 	};
 }): void {
+	lastWsUpdateEvent = Date.now();
 	const rec = getOrCreateSlot(notification.slot);
 	rec.events.push({
 		type: notification.type,
@@ -583,6 +592,7 @@ async function pollCommitmentLevels(): Promise<void> {
 		pollProcessed = processed;
 		pollConfirmed = confirmed;
 		pollFinalized = finalized;
+		lastPollSuccess = Date.now();
 	} catch {
 		// Polling failure is non-fatal; dashboard will show stale data
 	}
@@ -654,7 +664,27 @@ function formatDashboard(): string {
 		}
 	}
 
+	// Health line
+	const now = Date.now();
+	const STALE_THRESHOLD_MS = 30_000;
+	const agePoll = lastPollSuccess ? Math.floor((now - lastPollSuccess) / 1000) : -1;
+	const ageWsSlot = lastWsSlotEvent ? Math.floor((now - lastWsSlotEvent) / 1000) : -1;
+	const ageWsUpdate = lastWsUpdateEvent ? Math.floor((now - lastWsUpdateEvent) / 1000) : -1;
+	const fmtAge = (age: number) => (age < 0 ? "waiting" : `${age}s ago`);
+	const stale =
+		(lastPollSuccess > 0 && now - lastPollSuccess > STALE_THRESHOLD_MS) ||
+		(lastWsSlotEvent > 0 && now - lastWsSlotEvent > STALE_THRESHOLD_MS) ||
+		(lastWsUpdateEvent > 0 && now - lastWsUpdateEvent > STALE_THRESHOLD_MS);
+	const totalReconnects = wsSlotReconnects + wsUpdateReconnects;
+
 	lines.push("");
+	const healthParts = [
+		`Poll ${fmtAge(agePoll)}`,
+		`WS-slot ${fmtAge(ageWsSlot)}`,
+		`WS-update ${fmtAge(ageWsUpdate)}`,
+		`Reconnects: ${totalReconnects}`,
+	];
+	lines.push(`  HEALTH: ${healthParts.join(" | ")}${stale ? "  ⚠ STALE" : ""}`);
 	lines.push(`  DB: ${dbPath} | Tracked: ${slotMap.size} slots`);
 	lines.push(bar);
 
@@ -673,6 +703,7 @@ async function runWithReconnect(
 	name: string,
 	fn: (signal: AbortSignal) => Promise<void>,
 	outerSignal: AbortSignal,
+	onReconnect?: () => void,
 ): Promise<void> {
 	while (!outerSignal.aborted) {
 		const inner = new AbortController();
@@ -683,6 +714,7 @@ async function runWithReconnect(
 			await fn(inner.signal);
 		} catch (err) {
 			if (outerSignal.aborted) return;
+			onReconnect?.();
 			console.error(
 				`[${name}] disconnected: ${err}. Reconnecting in ${RECONNECT_DELAY_MS / 1000}s...`,
 			);
@@ -902,6 +934,7 @@ async function main(): Promise<void> {
 			}
 		},
 		outerAc.signal,
+		() => wsSlotReconnects++,
 	);
 
 	// Subscription 2: slotsUpdatesNotifications (unstable)
@@ -916,6 +949,7 @@ async function main(): Promise<void> {
 			}
 		},
 		outerAc.signal,
+		() => wsUpdateReconnects++,
 	);
 
 	// Periodic tasks
